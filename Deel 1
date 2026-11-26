@@ -1,0 +1,483 @@
+## Start van elke sessie
+
+```{r libraries}
+library(tidyverse)   # data inlezen, bewerken en plots (dplyr, ggplot2, readr, ...)
+library(limma)       # statistiek voor veel eiwitten tegelijk + batchcorrectie
+library(glmnet)      # LASSO logistische regressie
+library(ranger)      # random forest
+library(pROC)        # ROC-curve en AUC
+library(ggrepel)     # labels in plots die elkaar niet overlappen
+library(car)         # vif() om multicollineariteit te checken
+
+set.seed(42)                        # zelfde "toeval" bij elke run -> reproduceerbaar
+DATA_DIR <- "C:/Users/oxano/OneDrive/Bureaublad/LSA_proteomics/data"                     # <<< PAS AAN: map waar je 3 CSV-bestanden staan
+dir.create("figures", showWarnings = FALSE)   # map waar je figuren in worden bewaard
+theme_set(theme_bw(base_size = 13)) # nette, rustige plotstijl voor alle figuren
+kleur_leeftijd <- c(Young = "#1b9e77", Older = "#d95f02")  # kleurenblind-vriendelijke kleuren
+```
+
+---
+
+# DEEL 1 – Data verkennen, opschonen en controleren
+
+## Stap 1.1 – Data inlezen
+
+**Wat doen we?** We lezen de drie bestanden in en kijken hoe groot ze zijn.
+
+**Waarom?** Eerst moet je weten waarmee je werkt: hoeveel samples, hoeveel eiwitten, hoeveel mensen.
+
+```{r p1_load}
+# read_csv leest een csv-bestand in. show_col_types = FALSE houdt de uitvoer rustig.
+ann  <- read_csv("C:/Users/oxano/OneDrive/Bureaublad/LSA_proteomics/data/protein_annotation.csv", show_col_types = FALSE)    	# info per eiwit
+meta <- read_csv("C:/Users/oxano/OneDrive/Bureaublad/LSA_proteomics/data/sample_metadata.csv", show_col_types = FALSE)     	# info per sample
+npx  <- read_csv("C:/Users/oxano/OneDrive/Bureaublad/LSA_proteomics/data/proteins_npx_raw.csv", show_col_types = FALSE)   #eiwitmetingen
+
+
+# Maak een paar korte kolomnamen. De originele namen zijn lang en moeilijk te typen.
+meta <- meta |>
+  mutate(
+    sample_id = sample_kit_id,                                   # unieke code per bloedafname
+    donor     = subject.subjectGuid,                             # code per persoon
+    age_group = factor(subject.ageGroup,                         # leeftijdsgroep (Young = referentie)
+                       levels = c("Young Adult", "Older Adult"),
+                       labels = c("Young", "Older")),
+    sex       = factor(subject.biologicalSex),                   # sekse
+    cmv       = factor(cmv_status, levels = c("Negative", "Positive")),  # CMV-status (herpesvirus)
+    batch     = factor(olink_batch_id),                          # meetronde (batch)
+    plate     = factor(olink_plate_id),                          # plaat binnen de meetronde
+    visit     = sample.visitName,                                # welk bezoek
+    age       = sample.subjectAgeAtDraw,                         # leeftijd in jaren
+    crp       = infl.hs_crp                                      # CRP = ontstekingsmarker
+  )
+
+cat("Eiwittabel:", nrow(npx), "samples x", ncol(npx) - 1, "eiwitkolommen\n")
+cat("Metadata:  ", nrow(meta), "samples x", ncol(meta), "variabelen\n")
+cat("Annotatie: ", nrow(ann), "eiwitkolommen\n")
+cat("Aantal personen (donoren):", n_distinct(meta$donor), "\n")
+cat("Samples per persoon (mediaan):", median(table(meta$donor)), "\n")
+```
+
+**Wat zie je?**
+
+- 867 samples en 1481 eiwitkolommen.
+- 96 personen, met mediaan 10 samples per persoon. Dit zijn dus **herhaalde metingen**: dat moeten we later in de statistiek goed regelen.
+
+> **Let op:** op slide 7 van de opdracht staan getallen die 10 keer te groot lijken (bijvoorbeeld 23,968 in plaats van 2,3968). Dat komt door de decimale komma in dat screenshot. Het echte bestand is goed. Open de csv dus liever in R dan in Excel.
+
+## Stap 1.2 – Welk type is elke variabele?
+
+**Wat doen we?** We delen de variabelen in: nominaal, ordinaal, continu of discreet.
+
+**Waarom?** Het type bepaalt welke plot en welke toets je mag gebruiken. Dit is ook de eerste vraag in de opdracht.
+
+```{r p1_types}
+# Hier zie je het R-type van elke kolom. Dit is niet hetzelfde als het statistische type!
+table(sapply(meta, class))
+```
+
+Het statistische type van de belangrijkste variabelen:
+
+- **Nominaal** (categorieën zonder volgorde): persoon-code, cohort, sekse, ras, CMV-status, plate, batch.
+- **Ordinaal** (categorieën met volgorde): leeftijdsgroep (Young < Older), bezoek (volgorde in de tijd).
+- **Discreet** (hele getallen, tellen): leeftijd in jaren, dagen sinds eerste bezoek, geboortejaar, aantal ontbrekende waarden.
+- **Continu** (elk getal mogelijk): NPX (eiwitniveau, log2-schaal), BMI, CRP, laboratoriumwaarden, % onder detectielimiet.
+
+## Stap 1.3 – Controleren of de bestanden kloppen
+
+**Wat doen we?** We controleren of de drie bestanden bij elkaar passen en of er onmogelijke waarden in staan.
+
+**Waarom?** Een fout hier maakt alles later fout, zonder dat je het merkt.
+
+```{r p1_checks}
+# 1. Staan de samples in dezelfde volgorde in de eiwittabel en de metadata?
+stopifnot(all(npx$sample_kit_id == meta$sample_kit_id))      # stopt met een fout als het niet klopt
+stopifnot(identical(colnames(npx)[-1], ann$protein))         # kloppen de eiwitnamen met de annotatie?
+
+# 2. Verandert iets dat constant hoort te zijn binnen één persoon (sekse, groep, CMV)?
+meta |>
+  group_by(donor) |>
+  summarise(n_sex = n_distinct(sex), n_groep = n_distinct(age_group), n_cmv = n_distinct(cmv)) |>
+  filter(n_sex > 1 | n_groep > 1 | n_cmv > 1)                # moet 0 rijen geven
+
+# 3. Passen de leeftijden bij de groepen?
+meta |> group_by(age_group) |> summarise(minimum = min(age), maximum = max(age))
+
+# 4. Cohort en leeftijdsgroep: vallen die samen?
+table(meta$cohort.cohortGuid, meta$age_group)
+
+# 5. Onmogelijke waarden in lengte, gewicht en BMI: een waarde van 0 kan niet
+meta |> summarise(bmi_nul      = sum(am.bmi == 0,    na.rm = TRUE),
+                  gewicht_nul  = sum(am.weight == 0, na.rm = TRUE),
+                  lengte_nul   = sum(am.height == 0, na.rm = TRUE),
+                  bmi_NA       = sum(is.na(am.bmi)),
+                  glucose_laag = sum(chem.glucose < 50, na.rm = TRUE))
+meta$am.bmi[meta$am.bmi == 0]       <- NA     # onmogelijk -> "ontbrekend"
+meta$am.weight[meta$am.weight == 0] <- NA
+
+# 5b. Glucose: heel lage waarden (onder 50 mg/dL) bekijken, maar NIET weggooien
+laag <- meta |> filter(chem.glucose < 50) |> pull(donor)        # personen met een heel lage waarde
+meta |> filter(donor %in% laag) |>
+  select(donor, visit, chem.glucose) |> arrange(donor, visit)    # hoe ziet hun glucose op andere momenten eruit?
+meta$glucose_verdacht <- !is.na(meta$chem.glucose) & meta$chem.glucose < 50   # alleen een waarschuwingsvlag
+
+# 5c. Snelle controle van alle laboratoriumwaarden (minimum en maximum per variabele)
+meta |>
+  select(starts_with("chem."), starts_with("bc."), starts_with("lip."), infl.hs_crp, infl.esr) |>
+  pivot_longer(everything(), names_to = "variabele", values_to = "waarde") |>
+  group_by(variabele) |>
+  summarise(minimum = min(waarde, na.rm = TRUE), mediaan = median(waarde, na.rm = TRUE),
+            maximum = max(waarde, na.rm = TRUE), n_NA = sum(is.na(waarde))) |>
+  print(n = Inf)
+
+# 6. De kolom n_missing_npx klopt niet met de matrix zelf -> weghalen (we tellen zelf opnieuw)
+meta$n_missing_npx <- NULL
+```
+
+**Wat zie je?**
+
+- Young = 25 tot 37 jaar, Older = 55 tot 67 jaar. Er is een grote leeftijdskloof tussen de groepen.
+- **Belangrijk:** cohort BR1 is precies de Young-groep en BR2 precies de Older-groep. Je kunt "leeftijd" en "cohort" dus **nooit uit elkaar halen**. Dit moet in je Discussie als beperking.
+- BMI = 0 komt 2 keer voor en gewicht = 0 komt 6 keer voor. Dat zijn fouten en zijn nu NA. Lengte heeft geen nullen.
+- BMI en lengte ontbreken bij ongeveer 21% van de samples. Gebruik BMI dus liever niet als covariaat.
+- Glucose onder 50 komt 5 keer voor (33, 39, 41, 44 en 47 mg/dL). Dat is erg laag voor gezonde mensen. Bij de twee personen met meer metingen is hun glucose op andere momenten normaal (66 tot 109). Het lijkt dus een fout bij die ene meting, bijvoorbeeld door een bloedbuis die te lang bleef staan. Ik heb ze **niet verwijderd**, maar wel gemarkeerd met `glucose_verdacht`.
+- Andere opvallende laboratoriumwaarden: creatinine van 3,73 bij persoon BR1014 op één bezoek (eGFR 18), terwijl die persoon op alle andere bezoeken 0,77 tot 0,88 heeft. Dat is waarschijnlijk een fout of een uitzondering. We gebruiken creatinine niet, dus we laten het staan en noemen het.
+- **CRP** loopt maar van 0,3 tot 10. Ongeveer 24% zit op de ondergrens (0,3) en 13 samples op de bovengrens (10). De waarde is dus afgekapt aan beide kanten. **ESR** zit bij ongeveer 60% op de ondergrens (2).
+- BMI, gewicht en glucose gebruiken we in Deel 2 tot 4 niet. Dit heeft dus geen invloed op de resultaten, maar je moet het wel documenteren.
+
+```{r p1_batch_table}
+# Hoe zijn batch en leeftijdsgroep verdeeld? (belangrijk voor de batchcorrectie later)
+table(meta$batch, meta$age_group)
+suppressWarnings(chisq.test(table(meta$batch, meta$age_group))$p.value)
+```
+
+**Wat zie je?** De batches zijn niet gelijk verdeeld over jong en oud (bijvoorbeeld batch 20201752 is vooral Young). Batch en leeftijd zijn dus **deels met elkaar vermengd (confounded)**.
+
+## Stap 1.4 – Waar ontbreken waarden?
+
+**Wat doen we?** We tellen de ontbrekende waarden (NA) en maken een plaatje van het patroon.
+
+**Waarom?** Je moet weten **waarom** waarden ontbreken. Dat bepaalt wat je ermee moet doen. Willekeurig ontbrekend kun je vaak invullen (imputeren). Ontbrekend door techniek niet.
+
+```{r p1_missing}
+# Maak van de eiwittabel een matrix (alleen getallen), met sample-codes als rijnamen
+npx_mat <- as.matrix(npx[, -1])
+rownames(npx_mat) <- npx$sample_kit_id
+
+sum(is.na(npx_mat))                       # totaal aantal ontbrekende waarden
+mean(is.na(npx_mat)) * 100                # als percentage
+na_per_eiwit <- colSums(is.na(npx_mat))   # NA per eiwit
+sum(na_per_eiwit > 0)                     # aantal eiwitten met minstens 1 NA
+sum(rowSums(is.na(npx_mat)) > 0)          # aantal samples met minstens 1 NA
+
+# Plaatje: alleen eiwitten met NA, samples gesorteerd per batch
+na_eiwitten <- names(na_per_eiwit[na_per_eiwit > 0])
+volgorde    <- meta |> arrange(batch, plate) |> pull(sample_kit_id)
+
+na_lang <- as_tibble(is.na(npx_mat[volgorde, na_eiwitten]), rownames = "sample") |>
+  pivot_longer(-sample, names_to = "eiwit", values_to = "mist") |>      # lang formaat voor ggplot
+  left_join(meta |> select(sample = sample_kit_id, batch), by = "sample") |>
+  mutate(sample = factor(sample, levels = volgorde))
+
+fig_missing <- ggplot(na_lang, aes(sample, eiwit, fill = mist)) +
+  geom_tile() +
+  scale_fill_manual(values = c("white", "black"), labels = c("gemeten", "ontbreekt")) +
+  facet_grid(. ~ batch, scales = "free_x", space = "free_x") +          # één vak per batch
+  labs(x = "Samples (per batch)", y = "Eiwit", fill = NULL,
+       title = "Ontbrekende waarden hangen aan batches") +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        strip.text = element_text(size = 7))
+fig_missing
+ggsave("figures/fig1_missing.png", fig_missing, width = 10, height = 7, dpi = 150)
+```
+
+**Wat zie je?**
+
+- Er ontbreekt 0,8% van alle waarden, maar **elk sample** mist wel iets.
+- De zwarte blokken zitten per **batch** (of plate). Het is dus een **technisch** patroon: dat eiwit is in die meetronde niet gemeten of gefaald. Het is niet willekeurig en niet biologisch.
+
+## Stap 1.5 – Dubbele eiwitten samenvoegen
+
+**Wat doen we?** We voegen eiwitten samen die eigenlijk hetzelfde zijn.
+
+**Waarom?** Er zijn twee soorten dubbelingen:
+
+- **9 hernoemde eiwitten** (bijvoorbeeld DARS en DARS1). De naam is veranderd tussen Olink-versies. In elke batch is maar één van de twee gemeten. Samen vormen ze één compleet eiwit.
+- **IL6, TNF en CXCL8** zitten op elk van de 4 panelen. Dat zijn 4 technische herhalingen van één eiwit. We nemen het gemiddelde: dat is minder ruizig.
+
+Daardoor zijn er **1463 unieke eiwitten**, niet 1481 of 1472.
+
+```{r p1_duplicates}
+# a) Hernoemde paren vinden: dezelfde olink_id, andere naam
+paren <- ann |>
+  filter(duplicate_olink_id) |>
+  transmute(a = pmin(protein, same_assay_as),     # alfabetisch eerste naam
+            b = pmax(protein, same_assay_as)) |>  # alfabetisch tweede naam
+  distinct()
+
+# Controle: nooit allebei gemeten in hetzelfde sample?
+overlap <- mapply(function(a, b) sum(!is.na(npx_mat[, a]) & !is.na(npx_mat[, b])),
+                  paren$a, paren$b)
+overlap     # moet overal 0 zijn
+
+# b) Maak een kolom "feature": de uiteindelijke eiwitnaam
+ann$feature <- ann$protein                                   # standaard: eigen naam
+ann$feature[match(paren$b, ann$protein)] <- paren$a          # tweede naam krijgt de eerste naam
+herhaald <- ann |> count(assay) |> filter(n > 1) |> pull(assay)   # IL6, TNF, CXCL8
+ann$feature[ann$assay %in% herhaald] <- ann$assay[ann$assay %in% herhaald]
+n_distinct(ann$feature)                                      # 1463
+
+# Controle: hoe goed komen de 4 herhalingen overeen? (rangcorrelatie)
+for (e in herhaald) {
+  kolommen <- ann$protein[ann$assay == e]
+  print(round(cor(npx_mat[, kolommen], method = "spearman", use = "pairwise.complete.obs"), 2))
+}
+
+# c) Samenvoegen: gemiddelde per feature. na.rm = TRUE gebruikt de gemeten kolom als de andere NA is.
+groepen <- split(ann$protein, ann$feature)     # lijst: per feature de originele kolomnamen
+X1 <- sapply(groepen, function(kolommen) rowMeans(npx_mat[, kolommen, drop = FALSE], na.rm = TRUE))
+rownames(X1) <- rownames(npx_mat)
+dim(X1)                                         # 867 x 1463
+```
+
+**Wat zie je?** De overlap is overal 0. Dat bewijst dat het samenvoegen veilig is. De herhalingen van IL6 en TNF komen matig overeen (rangcorrelatie ongeveer 0,5 tot 0,98): niet alle kopieën zijn even betrouwbaar.
+
+## Stap 1.6 – Eiwitten met gaten verwijderen
+
+**Wat doen we?** Eiwitten die nog steeds NA hebben, gooien we weg.
+
+**Waarom?** Die NA's zitten in één hele batch of plate. Invullen (imputeren) zou betekenen dat we waarden verzinnen voor honderden samples. Dat zou bovendien precies samenvallen met het batcheffect. Het gaat om maar 21 eiwitten (1,4%), dus we verliezen weinig.
+
+```{r p1_drop_na}
+na_f    <- colSums(is.na(X1))          # NA per feature
+weg_na  <- names(na_f[na_f > 0])       # welke features hebben nog NA?
+length(weg_na)                         # 21
+
+# In welke batch zitten die gaten?
+tibble(eiwit = weg_na,
+       n_NA  = na_f[weg_na],
+       batch = sapply(weg_na, function(p) paste(unique(meta$batch[is.na(X1[, p])]), collapse = ", ")))
+
+X2 <- X1[, na_f == 0]                  # houd alleen features zonder NA
+dim(X2)                                # 867 x 1442
+stopifnot(sum(is.na(X2)) == 0)         # nu 0 ontbrekende waarden: imputatie niet nodig
+```
+
+## Stap 1.7 – Eiwitten die bijna nooit detecteerbaar zijn
+
+**Wat doen we?** We verwijderen eiwitten waarvan bijna alle metingen onder de detectielimiet (LOD) liggen.
+
+**Waarom?** Onder de LOD meet je vooral ruis. We houden de **waarden zelf** wel (ze vervangen door de LOD is niet aanbevolen voor continue analyses). Alleen de eiwitten die meestal onder de LOD liggen gaan eruit.
+
+- Meer dan 80% onder LOD: **weg**.
+- Tussen 50% en 80%: **blijft**, maar krijgt een waarschuwingsvlag.
+- De drempel van 80% is mijn keuze. Je mag een andere kiezen als je die kunt uitleggen.
+
+```{r p1_lod}
+# % onder LOD per feature (gemiddelde van de samengevoegde kolommen)
+lod <- ann |>
+  group_by(feature) |>
+  summarise(pct_below_lod = mean(pct_below_lod)) |>
+  filter(feature %in% colnames(X2))
+
+fig_lod <- ggplot(lod, aes(pct_below_lod)) +
+  geom_histogram(bins = 50, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = c(50, 80), linetype = "dashed", colour = "red") +
+  labs(x = "% samples onder detectielimiet", y = "Aantal eiwitten",
+       title = "Veel eiwitten zijn nauwelijks detecteerbaar")
+fig_lod
+ggsave("figures/fig2_lod.png", fig_lod, width = 7, height = 4.5, dpi = 150)
+
+lod_weg <- lod$feature[lod$pct_below_lod > 80]            # 47 eiwitten
+lod <- lod |> mutate(low_confidence = pct_below_lod > 50 & pct_below_lod <= 80)   # 101 eiwitten
+X3 <- X2[, !(colnames(X2) %in% lod_weg)]                  # verwijderen
+dim(X3)                                                   # 867 x 1395
+```
+
+## Stap 1.8 – Verdelingen: is normalisatie of log-transformatie nodig?
+
+**Wat doen we?** We kijken naar de vorm van de data.
+
+**Waarom?** NPX is al een log2-schaal die Olink zelf al genormaliseerd heeft (zie "Olink analysis" in de Methods van het artikel). Extra log-transformatie is dus **niet** nodig. We controleren dit wel.
+
+```{r p1_distributions}
+# Alle waarden samen
+fig_npx <- tibble(npx = as.vector(X3)) |>
+  ggplot(aes(npx)) +
+  geom_histogram(bins = 100, fill = "steelblue") +
+  labs(x = "NPX (log2-schaal)", y = "Aantal metingen", title = "Verdeling van alle NPX-waarden")
+fig_npx
+
+# Extreme waarden: hoeveel zitten er ver van het midden van hun eiwit?
+med_e <- apply(X3, 2, median)               # mediaan per eiwit
+mad_e <- apply(X3, 2, mad)                  # robuuste spreiding per eiwit
+z_rob <- sweep(sweep(X3, 2, med_e), 2, mad_e, "/")
+mean(abs(z_rob) > 6) * 100                  # % extreme cellen (ongeveer 0,2%)
+```
+
+**Wat zie je?**
+
+- Ongeveer symmetrisch, met staarten. Dat is normaal voor NPX.
+- Maar 0,2% van de waarden is extreem. Ze zitten verspreid over veel eiwitten en samples. Ik haal ze **niet** weg: het kan echte biologie zijn (bijvoorbeeld een tijdelijke ontsteking). Later gebruiken we methodes die tegen uitschieters kunnen.
+
+## Stap 1.9 – Clusteren de samples op biologie of op techniek?
+
+**Wat doen we?** We doen een PCA. Dat is een plaatje dat laat zien welke samples op elkaar lijken.
+
+**Waarom?** Dit beantwoordt de vraag uit de opdracht: "Do samples cluster by the biology you care about, or by a technical factor?"
+
+```{r p1_pca_before}
+# PCA: scale. = TRUE geeft elk eiwit hetzelfde gewicht
+pca_voor <- prcomp(X3, center = TRUE, scale. = TRUE)
+stopifnot(identical(rownames(pca_voor$x), meta$sample_id))   # zelfde volgorde als meta
+round(summary(pca_voor)$importance[2, 1:5] * 100, 1)         # % variantie per component
+
+# Hulpfunctie: PCA-uitkomst + metadata in één tabel
+maak_pc_tabel <- function(pca) {
+  as_tibble(pca$x[, 1:5]) |>
+    mutate(sample_id = rownames(pca$x)) |>
+    left_join(meta |> select(sample_id, batch, age_group, sex, cmv), by = "sample_id")
+}
+pc_voor <- maak_pc_tabel(pca_voor)
+
+# Plot 1: gekleurd op batch  /  Plot 2: gekleurd op leeftijdsgroep
+fig_pca_batch <- ggplot(pc_voor, aes(PC1, PC2, colour = batch)) + geom_point(size = 1.5) +
+  scale_colour_brewer(palette = "Set2") + labs(title = "Voor correctie: kleur = batch")
+fig_pca_age <- ggplot(pc_voor, aes(PC1, PC2, colour = age_group)) + geom_point(size = 1.5) +
+  scale_colour_manual(values = kleur_leeftijd) + labs(title = "Voor correctie: kleur = leeftijdsgroep")
+fig_pca_batch
+fig_pca_age
+
+# Hoeveel van elke PC wordt verklaard door batch / leeftijd / sekse / CMV? (R-kwadraat)
+factoren <- list(batch = meta$batch, leeftijdsgroep = meta$age_group, sekse = meta$sex, cmv = meta$cmv)
+r2_tabel <- function(pca) {
+  tab <- sapply(factoren, function(f) sapply(1:5, function(i) summary(lm(pca$x[, i] ~ f))$r.squared))
+  rownames(tab) <- paste0("PC", 1:5)
+  round(tab, 2)
+}
+r2_tabel(pca_voor)
+```
+
+**Wat zie je?**
+
+- De samples clusteren vooral op **batch**: bij mij verklaart batch ongeveer 67% van PC1.
+- Leeftijdsgroep verklaart op PC1 bijna niets (ongeveer 1%).
+- Conclusie: **techniek domineert**, dus we moeten corrigeren.
+
+## Stap 1.10 – Batcheffect corrigeren (zonder leeftijd weg te poetsen)
+
+**Wat doen we?** We halen het batcheffect uit de data, en laten leeftijdsgroep, sekse en CMV **in het model**.
+
+**Waarom?** Batch en leeftijdsgroep zijn deels vermengd (stap 1.3). Een simpele batchcorrectie zou dan ook een stukje echt leeftijdseffect kunnen verwijderen. `removeBatchEffect` met een `design` beschermt de biologie die we willen behouden.
+
+> **Let op:** de gecorrigeerde matrix gebruik je voor **plaatjes en clustering**. Voor **statistische toetsen** gebruik je de ongecorrigeerde data en zet je batch als covariaat in het model. Anders doe je alsof je data minder "ruis" heeft dan in werkelijkheid.
+
+```{r p1_batch_correct}
+# Biologie die behouden moet blijven
+design_bio <- model.matrix(~ age_group + sex + cmv, data = meta)
+
+# removeBatchEffect wil eiwitten als rijen -> t() draait de matrix om, en nog een keer terug
+X3_bc <- t(removeBatchEffect(t(X3), batch = meta$batch, design = design_bio))
+
+# PCA opnieuw, nu op de gecorrigeerde data
+pca_na <- prcomp(X3_bc, center = TRUE, scale. = TRUE)
+pc_na  <- maak_pc_tabel(pca_na)
+
+fig_pca_na_batch <- ggplot(pc_na, aes(PC1, PC2, colour = batch)) + geom_point(size = 1.5) +
+  scale_colour_brewer(palette = "Set2") + labs(title = "Na correctie: kleur = batch")
+fig_pca_na_age <- ggplot(pc_na, aes(PC1, PC2, colour = age_group)) + geom_point(size = 1.5) +
+  scale_colour_manual(values = kleur_leeftijd) + labs(title = "Na correctie: kleur = leeftijdsgroep")
+fig_pca_na_batch
+fig_pca_na_age
+ggsave("figures/fig3_pca_after.png", fig_pca_na_age, width = 7, height = 5, dpi = 150)
+
+r2_tabel(pca_na)
+```
+
+**Wat zie je?** Na correctie is batch bijna weg uit de eerste componenten (R-kwadraat ongeveer 0,02 of lager). Leeftijdsgroep zie je nu duidelijk (ongeveer 0,31 op PC2). Dat is wat we willen.
+
+## Stap 1.11 – Afwijkende samples (outliers)
+
+**Wat doen we?** We zoeken samples die afwijken van de rest, en beslissen of dat techniek of biologie is.
+
+**Waarom?** Een sample met kapotte meting kan alle analyses verstoren. Maar een sample dat afwijkt door echte biologie wil je juist houden.
+
+**Onze regel:** we verwijderen een sample alleen als het op **twee** manieren afwijkt:
+
+1. De spreiding (SD) van zijn eiwitwaarden is veel hoger dan bij andere samples in dezelfde batch.
+2. Het ligt ver weg van de rest in de PCA.
+
+```{r p1_outliers}
+# Regel 1: SD per sample, vergeleken binnen de eigen batch (robuuste z-score)
+sample_sd <- apply(X3, 1, sd)
+robuuste_z <- function(x, groep) {
+  m <- ave(x, groep, FUN = median)                  # mediaan per batch
+  s <- ave(abs(x - m), groep, FUN = median) * 1.4826   # robuuste spreiding per batch
+  (x - m) / s
+}
+z_sd       <- robuuste_z(sample_sd, meta$batch)
+sd_outlier <- abs(z_sd) > 4
+
+# Regel 2: afstand in PCA-ruimte (eerste 5 componenten, na batchcorrectie)
+pcs <- pca_na$x[, 1:5]
+afstand <- sqrt(rowSums(sweep(sweep(pcs, 2, apply(pcs, 2, median)), 2, apply(pcs, 2, mad), "/")^2))
+pca_outlier <- afstand > median(afstand) + 4 * mad(afstand)
+
+# Verwijderen als BEIDE regels kloppen
+weg_samples <- rownames(X3)[sd_outlier & pca_outlier]
+weg_samples      # bij mij 6 samples, o.a. KT00397 en KT02473
+
+# Plaatje: SD per sample per batch, rood = verwijderd
+fig_outlier <- tibble(sample = rownames(X3), sd = sample_sd, batch = meta$batch,
+                      weg = rownames(X3) %in% weg_samples) |>
+  ggplot(aes(batch, sd)) +
+  geom_boxplot(outlier.shape = NA, fill = "grey90") +
+  geom_jitter(aes(colour = weg), width = 0.15, size = 1.3) +
+  scale_colour_manual(values = c("grey40", "red"), labels = c("behouden", "verwijderd")) +
+  labs(x = "Batch", y = "SD van eiwitwaarden per sample", colour = NULL,
+       title = "Samples met een afwijkende spreiding")
+fig_outlier
+ggsave("figures/fig4_outliers.png", fig_outlier, width = 7, height = 4.5, dpi = 150)
+
+# Wat maakt zo'n sample afwijkend? Kijk naar de hoogste eiwitten (gecorrigeerde z-score)
+zb <- scale(X3_bc)
+for (s in weg_samples[1:2]) print(round(sort(zb[s, ], decreasing = TRUE)[1:6], 1))
+```
+
+**Wat zie je?**
+
+- Bij mijn Python-controle werden dezelfde 6 samples gevonden.
+- De twee duidelijkste (KT00397 en KT02473) hebben extreme waarden voor **eiwitten uit de cel** (zoals PARP1 en NBN). Dat past bij kapotte cellen of vervuiling in het plasma: een **technisch** probleem.
+- Andere samples van dezelfde personen zijn normaal en hun CRP en witte bloedcellen zijn normaal. Het is dus geen ontsteking en geen eigenschap van de persoon.
+
+## Stap 1.12 – Opslaan en controleren
+
+**Wat doen we?** We bewaren de schone data voor Deel 2, 3 en 4. We controleren ook of bekende leeftijdseiwitten uit het artikel terugkomen.
+
+**Waarom de controle?** Als CXCL17, WNT9A en GDF15 (bekend uit het artikel) duidelijk met leeftijd samenhangen, weten we dat de data nog goed bruikbaar is.
+
+```{r p1_save}
+houd <- !(rownames(X3) %in% weg_samples)          # TRUE = sample blijft
+X_clean    <- X3[houd, ]                           # ongecorrigeerd (voor toetsen)
+X_bc_clean <- X3_bc[houd, ]                        # batch-gecorrigeerd (voor plaatjes)
+meta_clean <- meta[houd, ]
+dim(X_clean)                                       # 861 samples x 1395 eiwitten
+n_distinct(meta_clean$donor)                       # nog steeds 96 personen
+
+saveRDS(list(X = X_clean, X_bc = X_bc_clean, meta = meta_clean, lod = lod), "data_clean.rds")
+
+# Positieve controle: correlatie met leeftijd op baseline (1 sample per persoon)
+base <- meta_clean$visit == "Flu Year 1 Day 0"
+sapply(c("CXCL17", "WNT9A", "GDF15", "EDA2R"),
+       function(p) cor(meta_clean$age[base], X_clean[base, p], method = "spearman"))
+```
+
+**Wat zie je?** Correlaties van ongeveer 0,65 tot 0,77. Goed: de data bevat het leeftijdssignaal.
+
+## Antwoorden op de vragen van Deel 1
+
+- **Hoeveel samples en features, welke types?** 867 samples en 1481 eiwitkolommen (1463 unieke eiwitten), 96 personen. Types: zie stap 1.2.
+- **Waar ontbreken waarden en waarom?** In batches en plates, door techniek (assay niet gemeten of gefaald). We hebben ze samengevoegd of verwijderd, niet geïmputeerd.
+- **Samples of features die afwijken?** 6 samples met kapotte meting (verwijderd). 47 eiwitten bijna nooit detecteerbaar (verwijderd). Losse extreme waarden bewaard.
+- **Is preprocessing nodig?** Ontdubbelen, filteren, batchcorrectie. Geen extra log-transformatie. Standaardiseren alleen voor PCA en machine learning.
+- **Clusteren de samples op biologie of techniek?** Voor correctie vooral batch. Na correctie ook leeftijd.
+- **Is de data geschikt voor deel 2 tot 4?** Ja. De bekende leeftijdseiwitten komen terug.

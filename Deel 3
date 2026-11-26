@@ -1,0 +1,140 @@
+# DEEL 3 – Multiple testing over alle eiwitten
+
+## Stap 3.1 – Contrast en model
+
+**Het contrast:** Older versus Young, per eiwit (verschil in log2-NPX).
+
+**Het model per eiwit:** `NPX ~ leeftijdsgroep + sekse + CMV + batch`.
+
+**Waarom limma?**
+
+- Het is een lineair model, hetzelfde idee als in Deel 2.
+- Het deelt informatie over alle eiwitten om de variantie stabieler te schatten (empirical Bayes). Bij 92 samples geeft dat betere p-waarden dan 1000 losse `lm()`'s.
+- Het is snel, en het artikel gebruikt ook lineaire modellen met leeftijdsgroep, CMV en sekse.
+
+**Waarom weer baseline?** Onafhankelijke observaties (zie Deel 2).
+
+## Stap 3.2 – Eiwitten weghalen vóór het toetsen
+
+**Wat doen we?** We verwijderen eiwitten die weinig informatie hebben, **zonder naar de groepslabels te kijken**.
+
+**Waarom?** Dit is een eis van de opdracht. Als je filtert op basis van het verschil tussen jong en oud, maak je jezelf te optimistisch. Dan lijken er meer hits dan er echt zijn.
+
+Onze twee filters (beide zonder groepslabel):
+
+1. **Detectielimiet:** meer dan 50% onder LOD gaat eruit. Dit komt uit de assay-informatie.
+2. **Totale variantie:** de laagste 10% (berekend over **alle** samples samen) gaat eruit. Eiwitten die nauwelijks variëren kun je niet toetsen, en dit filter hangt onder H0 niet samen met de toetsstatistiek.
+
+```{r p3_filter}
+d3 <- baseline |> droplevels()                      # baseline, ongebruikte batch-niveaus weg
+E  <- t(X[d3$sample_id, ])                         # limma wil eiwitten in de rijen
+n_start <- nrow(E)
+
+# Filter 1: detectielimiet (lod komt uit Deel 1)
+behoud_lod <- dat$lod$feature[dat$lod$pct_below_lod <= 50]
+E <- E[rownames(E) %in% behoud_lod, ]
+n_na_lod <- nrow(E)
+
+# Filter 2: lage totale variantie (onderste 10% weg)
+v <- apply(E, 1, var)
+E <- E[v > quantile(v, 0.10), ]
+n_getoetst <- nrow(E)
+
+cat("Start:", n_start, "| na LOD-filter:", n_na_lod, "| GETOETST:", n_getoetst, "\n")
+```
+
+**Wat zie je?** Ik kom op **1164 eiwitten** die getoetst worden (1395, dan 1294, dan 1164). Dit aantal moet je in het verslag noemen.
+
+## Stap 3.3 – Het model fitten
+
+```{r p3_fit}
+# Design-matrix: hier staan de variabelen in het model
+design <- model.matrix(~ age_group + sex + cmv + batch, data = d3)
+colnames(design)                       # controleer de namen: "age_groupOlder", "sexMale", "cmvPositive", ...
+
+fit <- lmFit(E, design)                # lineair model voor elk eiwit
+fit <- eBayes(fit)                     # empirical-Bayes: stabielere varianties
+```
+
+## Stap 3.4 – Multiple testing correctie
+
+**Wat doen we?** We corrigeren de p-waarden met Benjamini-Hochberg (BH).
+
+**Waarom?**
+
+- Bij 1164 toetsen verwacht je bij p < 0,05 al ongeveer 58 hits **puur door toeval**.
+- **Bonferroni** is erg streng en laat bijna niets over. **BH** controleert de **FDR**: het aandeel foute ontdekkingen onder je hits. Dat past beter bij een verkennende studie.
+
+```{r p3_results}
+res <- topTable(fit, coef = "age_groupOlder", number = Inf, sort.by = "P", adjust.method = "BH") |>
+  rownames_to_column("eiwit") |>
+  mutate(significant = adj.P.Val < 0.05,
+         richting = ifelse(logFC > 0, "hoger bij Older", "hoger bij Young"))
+
+cat("Getoetst:", nrow(res), "\n")
+cat("Ruwe p < 0,05:", sum(res$P.Value < 0.05), "\n")
+cat("FDR < 5%:", sum(res$significant),
+    "(", sum(res$significant & res$logFC > 0), "omhoog,", sum(res$significant & res$logFC < 0), "omlaag )\n")
+head(res, 10)
+write_csv(res, "part3_resultaten_leeftijd.csv")
+
+# Controle met bekende eiwitten uit het artikel
+res |> filter(eiwit %in% c("CXCL17", "WNT9A", "GDF15", "EDA2R", "LTBP2", "PAEP", "CTSV", "RET", "PROK1"))
+
+# Controle-contrasten uit hetzelfde model
+aantal_hits <- function(coef) sum(topTable(fit, coef = coef, number = Inf, adjust.method = "BH")$adj.P.Val < 0.05)
+c(CMV = aantal_hits("cmvPositive"), sekse = aantal_hits("sexMale"))
+```
+
+**Wat zie je bij mijn controle?**
+
+- Ongeveer **200 eiwitten** significant bij FDR 5% (ongeveer 187 hoger bij Older, de rest lager). Bovenaan staan CXCL17, LTBP2, EDA2R, WNT9A, SCARF2 en GDF15: precies de bekende eiwitten uit het artikel.
+- **CMV: 0 hits.** Dit past bij het artikel (geen proteoomverschil door CMV): een goede negatieve controle.
+- **Sekse: ongeveer 68 hits.** Een sterk biologisch verschil: een goede positieve controle.
+- Het artikel meldt 69 eiwitten (65 omhoog, 4 omlaag). Wij vinden er meer. Mogelijke redenen: ander model en filtering, andere QC, andere batchbehandeling. **Vergelijk vooral de top-eiwitten en de richting**, niet alleen het aantal.
+
+## Stap 3.5 – Figuren
+
+```{r p3_figures}
+# Figuur 1: p-waardenhistogram. Piek bij 0 = echt signaal. Vlak = geen signaal.
+fig_p3a <- ggplot(res, aes(P.Value)) +
+  geom_histogram(breaks = seq(0, 1, 0.05), fill = "steelblue", colour = "white") +
+  labs(x = "Ruwe p-waarde", y = "Aantal eiwitten", title = "Verdeling van p-waarden (Older vs Young)")
+fig_p3a
+ggsave("figures/fig7_p3_pvalues.png", fig_p3a, width = 6, height = 4, dpi = 150)
+
+# Figuur 2: volcano plot (effectgrootte tegen significantie)
+top_labels <- res |> filter(significant) |> slice_min(P.Value, n = 15)    # label de 15 sterkste
+fig_p3b <- ggplot(res, aes(logFC, -log10(P.Value))) +
+  geom_point(data = filter(res, !significant), colour = "grey70", size = 1) +
+  geom_point(data = filter(res, significant), aes(colour = richting), size = 1.8) +
+  geom_text_repel(data = top_labels, aes(label = eiwit), size = 3.2, max.overlaps = 30) +
+  scale_colour_manual(values = c("hoger bij Older" = "#d95f02", "hoger bij Young" = "#1b9e77")) +
+  labs(x = "log2-verschil in NPX (Older min Young), gecorrigeerd voor sekse, CMV en batch",
+       y = "-log10(ruwe p)", colour = NULL,
+       title = paste0(sum(res$significant), " van ", nrow(res), " eiwitten significant (FDR < 5%)"))
+fig_p3b
+ggsave("figures/fig8_p3_volcano.png", fig_p3b, width = 8, height = 6, dpi = 150)
+```
+
+## Stap 3.6 – De juiste interpretatie
+
+Zo formuleer je het **wel**:
+
+- "Van de 1164 getoetste eiwitten waren er X significant bij een FDR van 5%. We verwachten dat ongeveer 5% van deze X eiwitten een vals-positief is."
+- "log2-verschil 1 betekent ongeveer een verdubbeling van de eiwitconcentratie."
+- "Deze eiwitten zijn geassocieerd met leeftijdsgroep."
+
+Zo formuleer je het **niet**:
+
+- "Elk significant eiwit heeft maar 5% kans om fout te zijn." Dat is fout: de FDR gaat over de hele lijst, niet over één eiwit.
+- "De adjusted p-waarde is de kans dat de nulhypothese waar is." Fout.
+- "Leeftijd **veroorzaakt** deze verschillen." Fout: het is een associatie.
+
+Beperkingen:
+
+- Leeftijdsgroep valt samen met cohort (BR1 en BR2).
+- Batch is deels vermengd met leeftijd.
+- Alleen baseline (n = 92), dus beperkte power.
+
+---

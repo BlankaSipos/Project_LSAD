@@ -1,0 +1,371 @@
+# DEEL 4 – Machine learning
+
+## Stap 4.1 – Wat voorspellen we, en waarom?
+
+**Uitkomst:** leeftijdsgroep (Young of Older). Dit is **classificatie**.
+
+**Waarom classificatie en geen regressie op leeftijd?** Leeftijd is bimodaal (25 tot 37 en 55 tot 67 jaar). Een regressie zou eigenlijk alleen de groep voorspellen.
+
+**Wat eist de rubric voor Part 4?**
+
+- Een **logistische regressie (LR)** moet erbij zitten.
+- Feature-verdelingen bekijken en goed normaliseren.
+- Features ranken op basis van modelparameters.
+- Modellen met **minder features** fitten.
+- **Meerdere algoritmes**.
+- Evaluatie op een testset met **meerdere metrics**, en vergelijkende **figuren**.
+
+Onze modellen:
+
+1. **LR met 3 eiwitten** (weinig features).
+2. **LR met 10 eiwitten** (weinig features).
+3. **LASSO logistische regressie** met alle eiwitten (kiest zelf een klein aantal).
+4. **Random forest** met alle eiwitten.
+5. **Random forest met 10 eiwitten** (weinig features).
+6. **Controlemodel**: alleen batch. Dit toont of een model stiekem op batch leert.
+
+## Stap 4.2 – Data voorbereiden
+
+**Wat doen we?** We centreren elk eiwit per batch.
+
+**Waarom?** Batch is het grootste technische effect, en deels vermengd met leeftijdsgroep. Een model kan "stiekem" batch leren als stand-in voor leeftijd. Centreren per batch gebruikt **geen uitkomstlabels**, dus er is geen "data leakage".
+
+```{r p4_prepare}
+# Eiwitnamen veilig maken voor modelformules (haakjes of streepjes worden punten)
+x_all <- X
+colnames(x_all) <- make.names(colnames(x_all), unique = TRUE)
+
+# Per batch elk eiwit centreren op de batch-mediaan
+for (b in levels(meta$batch)) {
+  i <- meta$batch == b
+  x_all[i, ] <- sweep(x_all[i, , drop = FALSE], 2, apply(x_all[i, , drop = FALSE], 2, median))
+}
+y_all <- meta$age_group        # de uitkomst: Young of Older
+```
+
+## Stap 4.3 – Train en test splitsen (op persoonsniveau!)
+
+**Waarom op persoon?** Elke persoon heeft tot 10 samples. Zitten samples van dezelfde persoon in train **en** test, dan herkent het model de persoon en lijkt het te goed. Daarom gaat een persoon helemaal naar train of helemaal naar test: ongeveer 70% train en 30% test, per groep evenredig.
+
+```{r p4_split}
+set.seed(42)
+personen <- meta |> distinct(donor, age_group)               # 1 rij per persoon
+test_personen <- personen |>
+  group_by(age_group) |>
+  slice_sample(prop = 0.3) |>                                # 30% per groep
+  pull(donor)
+is_test <- meta$donor %in% test_personen                     # TRUE = sample hoort bij testpersoon
+
+x_train <- x_all[!is_test, ];  y_train <- y_all[!is_test]
+x_test  <- x_all[is_test, ];   y_test  <- y_all[is_test]
+table(y_train); table(y_test)                                # beide groepen in beide sets
+```
+
+## Stap 4.4 – Feature-verdelingen bekijken en normaliseren
+
+**Wat doen we?** We kijken naar de verdeling van de eiwitten en standaardiseren ze (gemiddelde 0, SD 1).
+
+**Waarom?**
+
+- Logistische regressie, LASSO en coëfficiënt-vergelijking werken pas goed als alle eiwitten op dezelfde schaal staan.
+- We berekenen gemiddelde en SD **alleen op de trainingsdata** en gebruiken die ook voor de testdata. Berekenen we ze op alle data, dan lekt informatie uit de test naar het model.
+
+```{r p4_normalize}
+# Scheefheid (skewness): 0 = symmetrisch
+scheefheid <- function(v) mean((v - mean(v))^3) / sd(v)^3
+
+fig_p4_dist <- tibble(SD = apply(x_train, 2, sd), Scheefheid = apply(x_train, 2, scheefheid)) |>
+  pivot_longer(everything(), names_to = "maat", values_to = "waarde") |>
+  ggplot(aes(waarde)) + geom_histogram(bins = 50, fill = "steelblue", colour = "white") +
+  facet_wrap(~ maat, scales = "free") +
+  labs(x = NULL, y = "Aantal eiwitten", title = "Verdeling van eiwitten in de trainingsdata (voor standaardiseren)")
+fig_p4_dist
+
+# Standaardiseren met train-gemiddelde en train-SD
+mu <- colMeans(x_train)
+s  <- apply(x_train, 2, sd)
+x_train_s <- sweep(sweep(x_train, 2, mu), 2, s, "/")
+x_test_s  <- sweep(sweep(x_test,  2, mu), 2, s, "/")
+
+range(colMeans(x_train_s))          # rond 0
+range(apply(x_train_s, 2, sd))      # precies 1
+```
+
+**Wat zie je?** De meeste eiwitten zijn redelijk symmetrisch. Een paar zijn scheef (bijvoorbeeld IL5 en GH1). Dat is oké voor LR en LASSO, en random forest heeft er geen last van. Na standaardiseren zijn gemiddelde en SD overal 0 en 1.
+
+## Stap 4.5 – Eiwitten selecteren voor de kleine modellen
+
+**Wat doen we?** We kiezen de top 3 en top 10 eiwitten met een t-toets, **alleen in de trainingsdata**.
+
+**Waarom alleen in train?** Kies je eiwitten met alle data (ook test), dan "weet" het model al iets over de test. Dan is je AUC te mooi.
+
+```{r p4_select}
+# Per eiwit: t-statistiek tussen Young en Older (alleen trainingsdata)
+t_stat <- apply(x_train_s, 2, function(v) abs(as.numeric(t.test(v ~ y_train)$statistic)))
+rang   <- names(sort(t_stat, decreasing = TRUE))     # eiwitten van sterkst naar zwakst
+top3   <- rang[1:3]
+top10  <- rang[1:10]
+top10
+```
+
+## Stap 4.6 – Model 1 en 2: logistische regressie (LR)
+
+**Wat doen we?** `glm` met `family = binomial`.
+
+**Waarom?**
+
+- De uitkomst is binair.
+- LR is eenvoudig en goed te interpreteren.
+- Met alle 1395 eiwitten zou gewone LR niet werken (meer eiwitten dan nuttige samples), daarom gebruiken we **een klein aantal** eiwitten.
+
+```{r p4_lr}
+# LR met 3 eiwitten
+d_lr3 <- data.frame(y = y_train, x_train_s[, top3])
+fit_lr3 <- glm(y ~ ., data = d_lr3, family = binomial)
+p_lr3 <- predict(fit_lr3, newdata = data.frame(x_test_s[, top3]), type = "response")   # kans op "Older"
+
+# LR met 10 eiwitten
+d_lr10 <- data.frame(y = y_train, x_train_s[, top10])
+fit_lr10 <- glm(y ~ ., data = d_lr10, family = binomial)
+p_lr10 <- predict(fit_lr10, newdata = data.frame(x_test_s[, top10]), type = "response")
+
+# Ranking van de eiwitten op de modelparameters (odds ratio per 1 SD)
+ci <- exp(confint.default(fit_lr10))                  # 95% BI (Wald)
+lr_tabel <- tibble(eiwit = names(coef(fit_lr10))[-1],
+                   OR    = exp(coef(fit_lr10))[-1],
+                   laag  = ci[-1, 1],
+                   hoog  = ci[-1, 2]) |>
+  arrange(desc(abs(log(OR))))
+lr_tabel
+
+fig_p4_lr <- ggplot(lr_tabel, aes(OR, reorder(eiwit, abs(log(OR))))) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_pointrange(aes(xmin = laag, xmax = hoog)) +
+  scale_x_log10() +
+  labs(x = "Odds ratio per 1 SD hoger eiwit (log-schaal, 95% BI)", y = NULL,
+       title = "LR met 10 eiwitten: welke eiwitten wegen het zwaarst?")
+fig_p4_lr
+```
+
+**Hoe lees je dit?**
+
+- Een **odds ratio (OR)** boven 1 betekent: hoger eiwit = grotere kans op Older. Onder 1 = kleinere kans.
+- Omdat alle eiwitten gestandaardiseerd zijn, kun je de OR's onderling vergelijken. Hoe verder van 1, hoe belangrijker.
+- Soms krijg je de waarschuwing "fitted probabilities numerically 0 or 1". Dan is de scheiding bijna perfect. Dat is niet erg, maar noem het in het verslag.
+
+## Stap 4.7 – Model 3: LASSO logistische regressie
+
+**Wat doen we?** LR met een straf die onbelangrijke eiwitten op exact 0 zet.
+
+**Waarom?**
+
+- Het gebruikt **alle** eiwitten maar houdt er maar een paar over (automatische selectie).
+- Het kan goed overweg met sterk samenhangende eiwitten.
+- De sterkte van de straf (lambda) kiezen we met kruisvalidatie in de trainingsdata. De folds maken we **per persoon**, om lekken te voorkomen.
+- `lambda.1se` kiest het eenvoudigste model dat bijna even goed is. Dat geeft nog minder eiwitten.
+
+```{r p4_lasso}
+# Folds per persoon maken
+persoon_train <- meta$donor[!is_test]
+unieke_personen <- unique(persoon_train)
+fold_per_persoon <- sample(rep(1:5, length.out = length(unieke_personen)))
+names(fold_per_persoon) <- unieke_personen
+foldid <- unname(fold_per_persoon[persoon_train])
+
+cv_lasso <- cv.glmnet(x_train_s, y_train, family = "binomial", alpha = 1,
+                      type.measure = "auc", foldid = foldid)
+plot(cv_lasso)                                   # AUC tegen lambda: zie je waar het model goed genoeg is?
+
+p_lasso <- as.numeric(predict(cv_lasso, newx = x_test_s, s = "lambda.1se", type = "response"))
+
+# Welke eiwitten zijn gekozen? (coëfficiënt is niet 0)
+b_lasso <- as.matrix(coef(cv_lasso, s = "lambda.1se"))[-1, 1]
+lasso_tabel <- tibble(eiwit = names(b_lasso), coef = b_lasso) |>
+  filter(coef != 0) |>
+  arrange(desc(abs(coef)))
+nrow(lasso_tabel)                                # aantal gekozen eiwitten (ongeveer 25)
+head(lasso_tabel, 10)
+
+fig_p4_lasso <- lasso_tabel |> slice_head(n = 15) |>
+  ggplot(aes(coef, reorder(eiwit, abs(coef)), fill = coef > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("TRUE" = "#d95f02", "FALSE" = "#1b9e77"), guide = "none") +
+  labs(x = "Coëfficiënt (log-odds Older, per 1 SD)", y = NULL, title = "LASSO: top 15 eiwitten")
+fig_p4_lasso
+```
+
+## Stap 4.8 – Model 4 en 5: random forest
+
+**Wat doen we?** Een random forest met alle eiwitten, en een met alleen de top 10.
+
+**Waarom?**
+
+- Het is een **ander soort algoritme** dan LR: niet-lineair, en het vindt zelf wisselwerkingen.
+- Het is een goede vergelijking voor de lineaire modellen. Zo voldoe je aan de eis van meerdere algoritmes.
+- `probability = TRUE` geeft kansen in plaats van alleen een klasse.
+- `importance = "permutation"` meet hoeveel slechter het model wordt als je één eiwit door elkaar husselt: een eerlijke maat voor belang.
+
+```{r p4_rf}
+d_train <- data.frame(y = y_train, x_train_s)
+
+rf_all <- ranger(y ~ ., data = d_train, num.trees = 500, probability = TRUE,
+                 importance = "permutation", seed = 42)
+p_rf_all <- predict(rf_all, data = data.frame(x_test_s))$predictions[, "Older"]
+
+rf_10 <- ranger(y ~ ., data = d_train[, c("y", top10)], num.trees = 500, probability = TRUE, seed = 42)
+p_rf_10 <- predict(rf_10, data = data.frame(x_test_s[, top10]))$predictions[, "Older"]
+
+# Belangrijkste eiwitten volgens de random forest
+rf_tabel <- tibble(eiwit = names(rf_all$variable.importance), belang = rf_all$variable.importance) |>
+  arrange(desc(belang))
+fig_p4_rf <- rf_tabel |> slice_head(n = 15) |>
+  ggplot(aes(belang, reorder(eiwit, belang))) +
+  geom_col(fill = "steelblue") +
+  labs(x = "Permutation importance", y = NULL, title = "Random forest: top 15 eiwitten")
+fig_p4_rf
+
+# Welke eiwitten staan in de top 15 van LASSO én random forest?
+intersect(head(lasso_tabel$eiwit, 15), head(rf_tabel$eiwit, 15))
+```
+
+## Stap 4.9 – Controlemodel: alleen batch
+
+**Wat doen we?** Een LR die **alleen** de batch kent.
+
+**Waarom?** Als dit model ook goed scoort, dan voorspellen de andere modellen misschien vooral batch. Onze eiwitmodellen moeten er duidelijk boven zitten.
+
+```{r p4_batch_only}
+fit_batch <- glm(y ~ batch, data = data.frame(y = y_train, batch = meta$batch[!is_test]), family = binomial)
+p_batch <- predict(fit_batch, newdata = data.frame(batch = meta$batch[is_test]), type = "response")
+```
+
+## Stap 4.10 – Alle modellen evalueren op de testset
+
+**Wat doen we?** We berekenen meerdere maten voor elk model, **alleen op de testpersonen**.
+
+**Waarom meerdere maten?** Eén getal vertelt nooit het hele verhaal:
+
+- **AUC:** hoe goed scheidt het model de twee groepen, over alle drempels heen. 0,5 = gokken, 1 = perfect.
+- **Accuracy:** aandeel goed voorspeld.
+- **Sensitiviteit:** hoeveel Older worden goed herkend.
+- **Specificiteit:** hoeveel Young worden goed herkend.
+- **Precision:** van wie als Older wordt voorspeld, hoeveel is echt Older.
+- **F1:** gemiddelde van precision en sensitiviteit.
+
+```{r p4_evaluate}
+# Hulpfunctie: alle maten voor één model (drempel 0,5)
+evalueer <- function(p, y_echt, naam) {
+  p <- as.numeric(p)
+  voorspeld <- ifelse(p > 0.5, "Older", "Young")
+  tp <- sum(voorspeld == "Older" & y_echt == "Older")
+  tn <- sum(voorspeld == "Young" & y_echt == "Young")
+  fp <- sum(voorspeld == "Older" & y_echt == "Young")
+  fn <- sum(voorspeld == "Young" & y_echt == "Older")
+  tibble(model = naam,
+         AUC = as.numeric(auc(roc(y_echt, p, levels = c("Young", "Older"), direction = "<", quiet = TRUE))),
+         accuracy = (tp + tn) / (tp + tn + fp + fn),
+         sensitiviteit = tp / (tp + fn),
+         specificiteit = tn / (tn + fp),
+         precision = tp / (tp + fp),
+         F1 = 2 * tp / (2 * tp + fp + fn))
+}
+
+# Alle kansen op een rij
+kansen <- list("LR (3 eiwitten)"  = p_lr3,
+               "LR (10 eiwitten)" = p_lr10,
+               "LASSO (alle)"     = p_lasso,
+               "Random forest (alle)" = p_rf_all,
+               "Random forest (10)"   = p_rf_10,
+               "Alleen batch (controle)" = p_batch)
+
+resultaten <- imap_dfr(kansen, ~ evalueer(.x, y_test, .y)) |>
+  mutate(model = factor(model, levels = names(kansen)))
+resultaten |> mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+# Wat zou je krijgen als je altijd de grootste groep voorspelt?
+max(table(y_test)) / length(y_test)
+```
+
+## Stap 4.11 – Figuren om de modellen te vergelijken
+
+```{r p4_figures}
+# Figuur 1: ROC-curves van alle modellen
+roc_lijst <- map(kansen, ~ roc(y_test, as.numeric(.x), levels = c("Young", "Older"), direction = "<", quiet = TRUE))
+fig_roc <- ggroc(roc_lijst, legacy.axes = TRUE) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", colour = "grey50") +
+  labs(x = "1 - specificiteit (fout-positief)", y = "Sensitiviteit", colour = NULL,
+       title = "ROC-curves op de testpersonen")
+fig_roc
+ggsave("figures/fig9_p4_roc.png", fig_roc, width = 8, height = 5.5, dpi = 150)
+
+# Figuur 2: alle maten naast elkaar
+fig_maten <- resultaten |>
+  pivot_longer(-model, names_to = "maat", values_to = "waarde") |>
+  ggplot(aes(maat, waarde, fill = model)) +
+  geom_col(position = position_dodge(0.85), width = 0.8) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(x = NULL, y = "Waarde", fill = NULL, title = "Prestaties van alle modellen op de testset")
+fig_maten
+ggsave("figures/fig10_p4_metrics.png", fig_maten, width = 10, height = 5.5, dpi = 150)
+
+# Figuur 3: verwarringsmatrix van het LASSO-model
+voorspeld_lasso <- factor(ifelse(p_lasso > 0.5, "Older", "Young"), levels = c("Young", "Older"))
+cm <- as.data.frame(table(Echt = y_test, Voorspeld = voorspeld_lasso))
+fig_cm <- ggplot(cm, aes(Voorspeld, Echt, fill = Freq)) +
+  geom_tile() + geom_text(aes(label = Freq), size = 7) +
+  scale_fill_gradient(low = "white", high = "steelblue", guide = "none") +
+  labs(title = "LASSO: verwarringsmatrix (testset)")
+fig_cm
+```
+
+**Wat zie je bij mijn controle (kan per split iets verschillen)?**
+
+- LR met 3 eiwitten: AUC ongeveer 0,94 tot 0,98.
+- LR met 10 eiwitten: AUC ongeveer 0,97 tot 0,99.
+- LASSO: AUC ongeveer 0,99, met ongeveer 25 eiwitten.
+- Random forest: AUC ongeveer 0,98 tot 0,99.
+- **Alleen batch: AUC ongeveer 0,58.** De eiwitten voegen dus echt veel toe en het model leert geen batch.
+- Hoogste eiwitten in de top: EDA2R, CXCL17, LTBP2, WNT9A, SCARF2.
+
+## Stap 4.12 – Extra controle: werkt het ook voor een nieuwe batch?
+
+**Wat doen we?** We trainen op 5 batches en testen op de zesde, voor elke batch.
+
+**Waarom?** Als de AUC ook dan hoog blijft, is het model niet afhankelijk van één batch. Dat is een strenge test.
+
+```{r p4_lobo}
+lobo <- map_dfr(levels(meta$batch), function(b) {
+  te <- meta$batch == b
+  mu_b <- colMeans(x_all[!te, ]); s_b <- apply(x_all[!te, ], 2, sd)        # standaardiseren op de trainbatches
+  xtr <- sweep(sweep(x_all[!te, ], 2, mu_b), 2, s_b, "/")
+  xte <- sweep(sweep(x_all[te, ],  2, mu_b), 2, s_b, "/")
+  fit <- glmnet(xtr, y_all[!te], family = "binomial", alpha = 1)
+  p <- as.numeric(predict(fit, xte, s = cv_lasso$lambda.1se, type = "response"))
+  tibble(batch = b, n_samples = sum(te),
+         AUC = as.numeric(auc(roc(y_all[te], p, levels = c("Young", "Older"), direction = "<", quiet = TRUE))))
+})
+lobo
+```
+
+**Wat zie je?** Bij mij ligt de AUC voor elke batch rond 1. Het model generaliseert dus naar een nieuwe batch. (De lambda komt uit de eerdere cross-validatie. Dat is een kleine onvolkomenheid die je mag noemen.)
+
+## Stap 4.13 – Hoe interpreteer je dit?
+
+- **De hoge AUC is niet vreemd.** Het leeftijdsverschil tussen de groepen is groot (25 tot 37 versus 55 tot 67 jaar), en veel eiwitten verschillen sterk.
+- **Gelijke prestaties van een klein en een groot model** laten zien dat een paar eiwitten (EDA2R, CXCL17, LTBP2) al bijna alles zeggen.
+- **De testset is klein:** ongeveer 28 personen. Betrouwbaarheidsintervallen zijn breed. Meerdere samples per persoon maken ze zelfs te smal. Herhaal desnoods met meerdere seeds.
+- **Voorspellend is niet causaal.** Een eiwit met een groot gewicht veroorzaakt de leeftijd niet.
+- **Leeftijdsgroep = cohort.** Het model kan ook cohortverschillen leren. De batch-controle en de leave-one-batch-out helpen, maar lossen dit niet volledig op.
+
+## Optioneel: een moeilijkere uitkomst
+
+Wil je een tweede, moeilijkere uitkomst, voorspel dan **CMV-status**. In mijn Python-controle gaf dat een AUC van ongeveer 0,6 tot 0,7: veel lager. Dat laat zien dat de pipeline geen signaal verzint. Let op: CMV hangt iets samen met leeftijd, dus controleer dit per leeftijdsgroep.
+
+---
+
+# Wat nu?
+
+- Het verslag (max. 5 pagina's) en de checklist per rubric-onderdeel staan in `rapport_en_rubric_checklist.md`.
+- Zet **dit .Rmd-bestand** in je GitHub-map. De opdracht vraagt om een geannoteerde markdown met je code.
+- Maak een tweede, **geanonimiseerde** versie van het verslag voor de peer review.
+- Deadline: inleveren voor **17/12, 23:59** in UFORA.

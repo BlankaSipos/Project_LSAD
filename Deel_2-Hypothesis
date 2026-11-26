@@ -1,0 +1,177 @@
+# DEEL 2 – Eigen onderzoeksvraag en toets
+
+## Stap 2.1 – De vraag en de hypothese
+
+**De vraag:**
+
+> Is een samengestelde "verouderingsscore" in plasma hoger bij oudere volwassenen, **onafhankelijk van** ontsteking (CRP), sekse, CMV-status en batch? En verschilt dat leeftijdseffect tussen CMV-negatieve en CMV-positieve personen?
+
+**Variabelen:**
+
+- **Uitkomst:** verouderingsscore. Type: continu.
+- **Hoofdvariabele:** leeftijdsgroep (Young of Older). Type: binair.
+- **Aanpassen voor (covariaten):** log2(CRP) (continu), sekse (binair), CMV (binair), batch (categorisch).
+- **Interactie:** leeftijdsgroep × CMV.
+
+**Hypotheses:**
+
+- **H1:** na correctie voor CRP, sekse, CMV en batch is de score hoger bij Older. De nulhypothese (H0) is: het verschil is 0.
+- **H2:** het leeftijdseffect verschilt tussen CMV-negatief en CMV-positief. H0: de interactie is 0.
+
+**Waarom deze vraag?**
+
+- Het artikel zegt dat verouderingseiwitten hoger zijn **zonder** systemische ontsteking en **zonder** CMV-effect op het proteoom. Wij toetsen dat in één model.
+- De vraag is multivariabel: één uitkomst, meerdere verklarende variabelen, correctie én een interactie. Dat eist de opdracht.
+- Je hypothese hoeft niet significant uit te komen. Een duidelijke reden is genoeg.
+
+## Stap 2.2 – De uitkomst maken: de verouderingsscore
+
+**Wat doen we?** We nemen 9 verouderingseiwitten, zetten ze op dezelfde schaal en nemen het gemiddelde.
+
+**Waarom?**
+
+- De 9 eiwitten komen uit Fig. 1b van het artikel: **vooraf gekozen, niet op basis van onze eigen p-waarden**. Anders zou je cirkelredeneren (kiezen op basis van het resultaat en dan toetsen).
+- Eén score geeft één toets in plaats van 9. Dat is minder multiple testing en minder ruis.
+
+```{r p2_data}
+dat      <- readRDS("data_clean.rds")                 # schone data uit Deel 1
+X        <- dat$X
+meta     <- dat$meta
+baseline <- meta |> filter(visit == "Flu Year 1 Day 0")   # 1 sample per persoon (zie waarom hieronder)
+
+verouderings_eiwitten <- c("CXCL17", "WNT9A", "GDF15", "EDA2R", "LTBP2", "SCARF2", "SOST", "WFDC2", "ACTA2")
+stopifnot(all(verouderings_eiwitten %in% colnames(X)))    # staan ze allemaal in onze data?
+
+d <- baseline |> mutate(log2_crp = log2(crp)) |> filter(!is.na(log2_crp)) |> droplevels()
+z <- scale(X[d$sample_id, verouderings_eiwitten])    # z-score per eiwit: elk eiwit telt even zwaar
+d$score <- rowMeans(z)                                # gemiddelde z-score = verouderingsscore
+round(cor(z), 2)                                      # hangen de eiwitten samen? (zo ja: score is zinvol)
+```
+
+**Waarom alleen baseline (Flu Year 1 Day 0)?**
+
+- Elke persoon heeft tot 10 samples. Die zijn **niet onafhankelijk** (dezelfde persoon). Een gewone regressie met alle samples is dan te optimistisch.
+- Met één sample per persoon zijn de metingen wel onafhankelijk. Het artikel gebruikt hetzelfde baselinemoment.
+
+## Stap 2.3 – Kan dit wel? (haalbaarheidscheck)
+
+```{r p2_feasibility}
+nrow(d)                              # aantal personen in het model (92)
+table(d$age_group, d$cmv)            # alle 4 groepen groot genoeg? (ruim 15 elk)
+table(d$batch, d$age_group)          # batch en leeftijd zijn deels vermengd -> batch in het model
+mean(d$crp <= 0.3)                   # ongeveer 25% van CRP zit op de ondergrens (0,3)
+sum(d$crp >= 10)                     # enkele samples zitten op de bovengrens (10)
+```
+
+**Wat zie je?**
+
+- 92 personen (van de 96): 4 personen hebben geen "Flu Year 1 Day 0"-sample (BR1029, BR1035, BR2004 en BR2027; hun eerste sample is een ander bezoek). Noem dit in je verslag.
+- Alle vier de CMV-bij-leeftijd-groepen hebben ruim 15 personen. De interactie is dus toetsbaar.
+- Het model heeft ongeveer 9 parameters. De vuistregel is minstens 10 observaties per parameter: net voldoende.
+- 25% van de CRP-waarden zit op de ondergrens (0,3) en enkele op de bovengrens (10). Dat noem je een beperking: CRP is aan beide kanten afgekapt.
+
+## Stap 2.4 – Het model
+
+**Wat doen we?** Lineaire regressie (`lm`).
+
+**Waarom?**
+
+- De uitkomst is continu.
+- Elke persoon telt één keer, dus de observaties zijn onafhankelijk.
+- Met `lm` kun je meerdere variabelen tegelijk corrigeren en een interactie toetsen.
+
+```{r p2_model}
+# Hoofdmodel: leeftijdsgroep gecorrigeerd voor CRP, sekse, CMV en batch
+m0 <- lm(score ~ age_group + log2_crp + sex + cmv + batch, data = d)
+summary(m0)
+
+# Betrouwbaarheidsintervallen (95%) voor de coëfficiënten
+round(confint(m0)[c("age_groupOlder", "log2_crp", "sexMale", "cmvPositive"), ], 3)
+
+# Model met interactie leeftijdsgroep x CMV
+m1 <- lm(score ~ age_group * cmv + log2_crp + sex + batch, data = d)
+anova(m0, m1)                         # F-toets: voegt de interactie iets toe?
+
+# Effect in "standaarddeviaties van de score" (effectgrootte)
+coef(m0)["age_groupOlder"] / sd(d$score)
+```
+
+**Hoe lees je dit?**
+
+- **age_groupOlder** is het verschil in score tussen Older en Young, bij gelijke CRP, sekse, CMV en batch.
+- **log2_crp** is de verandering in score per verdubbeling van CRP.
+- **p-waarde:** de kans op zo'n groot verschil als er in werkelijkheid geen verschil was. Het is **niet** de kans dat de hypothese waar is.
+- **Betrouwbaarheidsinterval:** het bereik waarin het echte effect waarschijnlijk ligt. Als 0 erin zit, is er geen duidelijk effect.
+
+**Wat zie je bij mijn controle?**
+
+- Leeftijdsgroep: **ongeveer +1,4** score-eenheden (95% BI ongeveer 1,2 tot 1,6; p veel kleiner dan 0,001). Dat is ongeveer 1,8 SD van de score: een groot effect.
+- CRP: ongeveer −0,015 per verdubbeling (p = 0,62). **Geen bewijs** dat ontsteking dit verklaart.
+- CMV: p ongeveer 0,30. Sekse: p ongeveer 0,85.
+- Interactie leeftijd × CMV: p ongeveer 0,27. **Geen bewijs** voor een verschil per CMV-status.
+
+> **Let op bij het formuleren:** "geen bewijs voor een interactie" is niet hetzelfde als "bewezen dat er geen interactie is". Met 92 personen heeft de interactietoets weinig power.
+
+## Stap 2.5 – Controleren of het model mag
+
+**Wat doen we?** We checken de aannames van lineaire regressie.
+
+**Waarom?** Als de aannames niet kloppen, zijn p-waarden en intervallen onbetrouwbaar. De rubric vraagt hier expliciet naar.
+
+```{r p2_assumptions}
+par(mfrow = c(2, 2))
+plot(m0)                              # 4 plaatjes: lineariteit, normaliteit, spreiding, invloedrijke punten
+par(mfrow = c(1, 1))
+
+shapiro.test(resid(m0))               # zijn de residuen normaal verdeeld? (p > 0,05 = oké)
+ncvTest(m0)                           # is de spreiding constant? (p > 0,05 = oké)
+vif(m0)                               # overlappen predictoren te veel? (onder 5 = oké)
+which(cooks.distance(m0) > 4 / nrow(d))   # punten met veel invloed
+```
+
+**De aannames:**
+
+1. Lineair verband.
+2. Onafhankelijke observaties (ja, door 1 sample per persoon).
+3. Normaal verdeelde residuen.
+4. Constante spreiding (homoscedasticiteit).
+5. Geen sterke overlap tussen predictoren.
+
+Als iets niet klopt: vermeld dat, en controleer of de conclusie hetzelfde blijft zonder de invloedrijke punten.
+
+## Stap 2.6 – Figuren
+
+```{r p2_figures}
+# Figuur 1: score per leeftijdsgroep en CMV-status
+fig_p2a <- ggplot(d, aes(age_group, score, fill = cmv)) +
+  geom_boxplot(alpha = 0.5, outlier.shape = NA, position = position_dodge(0.8)) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8), size = 1.8) +
+  labs(x = "Leeftijdsgroep", y = "Verouderingsscore (gemiddelde z-score)", fill = "CMV",
+       title = "Verouderingsscore per leeftijdsgroep en CMV-status")
+fig_p2a
+ggsave("figures/fig5_p2_score.png", fig_p2a, width = 7, height = 5, dpi = 150)
+
+# Figuur 2: effecten met 95% betrouwbaarheidsinterval (zonder batch-termen)
+coef_tabel <- as_tibble(confint(m0), rownames = "term") |>
+  mutate(schatting = coef(m0)) |>
+  rename(laag = `2.5 %`, hoog = `97.5 %`) |>
+  filter(term != "(Intercept)", !str_detect(term, "batch"))
+
+fig_p2b <- ggplot(coef_tabel, aes(schatting, reorder(term, schatting))) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_pointrange(aes(xmin = laag, xmax = hoog)) +
+  labs(x = "Effect op verouderingsscore (95% BI)", y = NULL,
+       title = "Geschatte effecten, gecorrigeerd voor batch")
+fig_p2b
+ggsave("figures/fig6_p2_coef.png", fig_p2b, width = 7, height = 4, dpi = 150)
+```
+
+## Wat schrijf je in het verslag? (Deel 2)
+
+- Eén zin met de vraag, één zin met H1 en H2.
+- Het model in woorden: "lineaire regressie, score ~ leeftijdsgroep + log2(CRP) + sekse + CMV + batch, n = 92".
+- Het effect met betrouwbaarheidsinterval, niet alleen de p-waarde.
+- De controle van de aannames in één zin.
+- De **beperking**: leeftijdsgroep = cohort (BR1 en BR2), CRP afgekapt (0,3 tot 10), 4 van de 96 personen zonder baseline-sample, kleine groep voor de interactie.
+
+---

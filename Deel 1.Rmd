@@ -28,26 +28,33 @@ kleur_leeftijd <- c(Young = "#1b9e77", Older = "#d95f02")  # kleurenblind-vriend
 
 ```{r p1_load}
 # read_csv leest een csv-bestand in. show_col_types = FALSE houdt de uitvoer rustig.
-ann  <- read_csv("C:/Users/oxano/OneDrive/Bureaublad/LSA_proteomics/data/protein_annotation.csv", show_col_types = FALSE)    	# info per eiwit
-meta <- read_csv("C:/Users/oxano/OneDrive/Bureaublad/LSA_proteomics/data/sample_metadata.csv", show_col_types = FALSE)     	# info per sample
-npx  <- read_csv("C:/Users/oxano/OneDrive/Bureaublad/LSA_proteomics/data/proteins_npx_raw.csv", show_col_types = FALSE)   #eiwitmetingen
+ann  <- read_csv("data/protein_annotation.csv", show_col_types = FALSE)    	# info per eiwit
+meta <- read_csv("data/sample_metadata.csv", show_col_types = FALSE)     	# info per sample
+npx  <- read_csv("data/proteins_npx_raw.csv", show_col_types = FALSE)   #eiwitmetingen
 
 
-# Maak een paar korte kolomnamen. De originele namen zijn lang en moeilijk te typen.
+# Verander de kolomnamen -> makkelijker voor interpretatie
 meta <- meta |>
   mutate(
-    sample_id = sample_kit_id,                                   # unieke code per bloedafname
-    donor     = subject.subjectGuid,                             # code per persoon
-    age_group = factor(subject.ageGroup,                         # leeftijdsgroep (Young = referentie)
-                       levels = c("Young Adult", "Older Adult"),
-                       labels = c("Young", "Older")),
-    sex       = factor(subject.biologicalSex),                   # sekse
-    cmv       = factor(cmv_status, levels = c("Negative", "Positive")),  # CMV-status (herpesvirus)
-    batch     = factor(olink_batch_id),                          # meetronde (batch)
-    plate     = factor(olink_plate_id),                          # plaat binnen de meetronde
-    visit     = sample.visitName,                                # welk bezoek
-    age       = sample.subjectAgeAtDraw,                         # leeftijd in jaren
-    crp       = infl.hs_crp                                      # CRP = ontstekingsmarker
+    subject.ageGroup = factor(subject.ageGroup,
+                              levels = c("Young Adult", "Older Adult"),
+                              labels = c("Young", "Older")),
+    subject.biologicalSex = factor(subject.biologicalSex),
+    cmv_status       = factor(cmv_status, levels = c("Negative", "Positive")),
+    olink_batch_id   = factor(olink_batch_id),
+    olink_plate_id   = factor(olink_plate_id)
+  ) |>
+  rename(
+    sample_id = sample_kit_id,           # unieke code per bloedafname
+    donor     = subject.subjectGuid,     # code per persoon
+    age_group = subject.ageGroup,        # leeftijdsgroep (Young = referentie)
+    sex       = subject.biologicalSex,   # sekse
+    cmv       = cmv_status,              # CMV-status (herpesvirus)
+    batch     = olink_batch_id,          # meetronde (batch)
+    plate     = olink_plate_id,          # plaat binnen de meetronde
+    visit     = sample.visitName,        # welk bezoek
+    age       = sample.subjectAgeAtDraw, # leeftijd in jaren
+    crp       = infl.hs_crp              # CRP = ontstekingsmarker
   )
 
 cat("Eiwittabel:", nrow(npx), "samples x", ncol(npx) - 1, "eiwitkolommen\n")
@@ -55,6 +62,8 @@ cat("Metadata:  ", nrow(meta), "samples x", ncol(meta), "variabelen\n")
 cat("Annotatie: ", nrow(ann), "eiwitkolommen\n")
 cat("Aantal personen (donoren):", n_distinct(meta$donor), "\n")
 cat("Samples per persoon (mediaan):", median(table(meta$donor)), "\n")
+
+
 ```
 
 **Wat zie je?**
@@ -202,7 +211,7 @@ ggsave("figures/fig1_missing.png", fig_missing, width = 10, height = 7, dpi = 15
 **Waarom?** Er zijn twee soorten dubbelingen:
 
 - **9 hernoemde eiwitten** (bijvoorbeeld DARS en DARS1). De naam is veranderd tussen Olink-versies. In elke batch is maar één van de twee gemeten. Samen vormen ze één compleet eiwit.
-- **IL6, TNF en CXCL8** zitten op elk van de 4 panelen. Dat zijn 4 technische herhalingen van één eiwit. We nemen het gemiddelde: dat is minder ruizig.
+- **IL6, TNF en CXCL8** zitten op elk van de 4 panelen. Dat zijn 4 technische herhalingen van één eiwit. We nemen het gemiddelde: dat is minder ruizig. -> zie ppt 1 dia 65 pseudoreplicate (zeker vermelden in ons verslag!)
 
 Daardoor zijn er **1463 unieke eiwitten**, niet 1481 of 1472.
 
@@ -236,16 +245,16 @@ for (e in herhaald) {
 groepen <- split(ann$protein, ann$feature)     # lijst: per feature de originele kolomnamen
 X1 <- sapply(groepen, function(kolommen) rowMeans(npx_mat[, kolommen, drop = FALSE], na.rm = TRUE))
 rownames(X1) <- rownames(npx_mat)
-dim(X1)                                         # 867 x 1463
+dim(X1)                                         # 867 x 1463   -> nieuwe kolom dus maken een de eerste volgens het alfabet blijft behouden
 ```
 
-**Wat zie je?** De overlap is overal 0. Dat bewijst dat het samenvoegen veilig is. De herhalingen van IL6 en TNF komen matig overeen (rangcorrelatie ongeveer 0,5 tot 0,98): niet alle kopieën zijn even betrouwbaar.
+**Wat zie je?** De overlap is overal 0. Dat bewijst dat het samenvoegen veilig is. De herhalingen van IL6 en TNF komen matig overeen (rangcorrelatie ongeveer 0,5 tot 0,98): niet alle kopieën zijn even betrouwbaar. -> wat moeten we hier dan mee doen?
 
 ## Stap 1.6 – Eiwitten met gaten verwijderen
 
 **Wat doen we?** Eiwitten die nog steeds NA hebben, gooien we weg.
 
-**Waarom?** Die NA's zitten in één hele batch of plate. Invullen (imputeren) zou betekenen dat we waarden verzinnen voor honderden samples. Dat zou bovendien precies samenvallen met het batcheffect. Het gaat om maar 21 eiwitten (1,4%), dus we verliezen weinig.
+**Waarom?** Die NA's zitten in één hele batch of plate. Invullen (imputeren) zou betekenen dat we waarden verzinnen voor honderden samples. Dat zou bovendien precies samenvallen met het batcheffect. Het gaat om maar 21 eiwitten (1,4%), dus we verliezen weinig. -> duidelijk kunnen verklaren in het verslag! 
 
 ```{r p1_drop_na}
 na_f    <- colSums(is.na(X1))          # NA per feature
@@ -270,7 +279,7 @@ stopifnot(sum(is.na(X2)) == 0)         # nu 0 ontbrekende waarden: imputatie nie
 
 - Meer dan 80% onder LOD: **weg**.
 - Tussen 50% en 80%: **blijft**, maar krijgt een waarschuwingsvlag.
-- De drempel van 80% is mijn keuze. Je mag een andere kiezen als je die kunt uitleggen.
+- De drempel van 80% -> zie literatuur gelijkaardig! 
 
 ```{r p1_lod}
 # % onder LOD per feature (gemiddelde van de samengevoegde kolommen)
@@ -311,7 +320,8 @@ fig_npx
 med_e <- apply(X3, 2, median)               # mediaan per eiwit
 mad_e <- apply(X3, 2, mad)                  # robuuste spreiding per eiwit
 z_rob <- sweep(sweep(X3, 2, med_e), 2, mad_e, "/")
-mean(abs(z_rob) > 6) * 100                  # % extreme cellen (ongeveer 0,2%)
+mean(abs(z_rob) > 6) * 100                  # % extreme cellen (ongeveer 0,2%)  
+# met norml + stdev
 ```
 
 **Wat zie je?**
@@ -326,7 +336,7 @@ mean(abs(z_rob) > 6) * 100                  # % extreme cellen (ongeveer 0,2%)
 **Waarom?** Dit beantwoordt de vraag uit de opdracht: "Do samples cluster by the biology you care about, or by a technical factor?"
 
 ```{r p1_pca_before}
-# PCA: scale. = TRUE geeft elk eiwit hetzelfde gewicht
+# PCA: scale. = TRUE geeft elk eiwit hetzelfde gewicht   # PCA dia 164! (verkleinen !)
 pca_voor <- prcomp(X3, center = TRUE, scale. = TRUE)
 stopifnot(identical(rownames(pca_voor$x), meta$sample_id))   # zelfde volgorde als meta
 round(summary(pca_voor)$importance[2, 1:5] * 100, 1)         # % variantie per component
@@ -363,7 +373,7 @@ r2_tabel(pca_voor)
 - Leeftijdsgroep verklaart op PC1 bijna niets (ongeveer 1%).
 - Conclusie: **techniek domineert**, dus we moeten corrigeren.
 
-## Stap 1.10 – Batcheffect corrigeren (zonder leeftijd weg te poetsen)
+## Stap 1.10 – Batcheffect corrigeren (niet op leeftijd)
 
 **Wat doen we?** We halen het batcheffect uit de data, en laten leeftijdsgroep, sekse en CMV **in het model**.
 
@@ -415,7 +425,7 @@ robuuste_z <- function(x, groep) {
   (x - m) / s
 }
 z_sd       <- robuuste_z(sample_sd, meta$batch)
-sd_outlier <- abs(z_sd) > 4
+sd_outlier <- abs(z_sd) > 4   # indien de stdev meer dan 4 afwijkt zal deze waarde worden verwijderd
 
 # Regel 2: afstand in PCA-ruimte (eerste 5 componenten, na batchcorrectie)
 pcs <- pca_na$x[, 1:5]
@@ -465,7 +475,7 @@ n_distinct(meta_clean$donor)                       # nog steeds 96 personen
 
 saveRDS(list(X = X_clean, X_bc = X_bc_clean, meta = meta_clean, lod = lod), "data_clean.rds")
 
-# Positieve controle: correlatie met leeftijd op baseline (1 sample per persoon)
+# Positieve controle: correlatie met leeftijd op baseline (1 sample per persoon)  # welke eiwitten zijn aan de leeftijjd gecorreleerd (zie artikel)
 base <- meta_clean$visit == "Flu Year 1 Day 0"
 sapply(c("CXCL17", "WNT9A", "GDF15", "EDA2R"),
        function(p) cor(meta_clean$age[base], X_clean[base, p], method = "spearman"))
